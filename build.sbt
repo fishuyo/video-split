@@ -22,12 +22,12 @@ lazy val os = System.getProperty("os.name").toLowerCase match {
 }
 
 lazy val arch = System.getProperty("os.arch").toLowerCase match {
-  case x if x.contains("aarch64") || x.contains("arm64") => "arm64"
+  case x if x.contains("aarch64") || x.contains("arm64") => "-arm64"
   case _                                                 => ""
 }
 
 val lwjglVersion = "3.3.6"
-val lwjglNatives = s"natives-$os-$arch"
+val lwjglNatives = s"natives-$os$arch"
 
 libraryDependencies ++= Seq(
   // JavaCPP FFmpeg - platform-specific (includes all native libraries)
