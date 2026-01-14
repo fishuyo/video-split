@@ -23,7 +23,7 @@ lazy val os = System.getProperty("os.name").toLowerCase match {
 
 lazy val arch = System.getProperty("os.arch").toLowerCase match {
   case x if x.contains("aarch64") || x.contains("arm64") => "arm64"
-  case _                                                 => "x86_64"
+  case _                                                 => ""
 }
 
 val lwjglVersion = "3.3.6"
