@@ -2,7 +2,7 @@ name := "video-split"
 
 version := "0.1.0-SNAPSHOT"
 
-scalaVersion := "3.3.3"
+scalaVersion := "3.3.4"
 
 // JavaCPP and FFmpeg versions
 // Current: JavaCPP 1.5.10, FFmpeg 6.1.1 (stable, known to work)
