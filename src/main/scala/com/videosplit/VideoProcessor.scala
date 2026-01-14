@@ -294,8 +294,6 @@ class VideoProcessor(config: ClusterConfig) {
                                       if (combinedFrame != null) {
                                         av_frame_unref(combinedFrame)
                                       }
-                                    } else {
-                                      logger.warn(s"Skipping invalid combined frame: ${combinedWidth_actual}x${combinedHeight_actual}")
                                     }
                                   case Failure(e) =>
                                     logger.error(s"Failed to combine frames: ${e.getMessage}", e)
