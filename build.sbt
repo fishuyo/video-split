@@ -26,7 +26,7 @@ lazy val arch = System.getProperty("os.arch").toLowerCase match {
   case _                                                 => "x86_64"
 }
 
-val lwjglVersion = "3.3.3"
+val lwjglVersion = "3.3.4"
 val lwjglNatives = s"natives-$os-$arch"
 
 libraryDependencies ++= Seq(
