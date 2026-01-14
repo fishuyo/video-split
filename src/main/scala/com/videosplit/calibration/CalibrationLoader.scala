@@ -189,17 +189,29 @@ class WarpMap(val width: Int, val height: Int) {
   
   /**
    * Convert 3D direction to equirectangular (u, v) coordinates
+   * Right-handed coordinates: +x right, -z forward, +y up
+   * Center (uv 0.5, 0.5) maps to direction (0, 0, -1)
    * u, v in range [0, 1]
    */
   def directionToEquirectangular(dirX: Float, dirY: Float, dirZ: Float): (Float, Float) = {
-    // Convert 3D direction to spherical coordinates
-    val theta = math.atan2(dirY, dirX).toFloat  // Azimuth [-π, π]
     val length = math.sqrt(dirX*dirX + dirY*dirY + dirZ*dirZ).toDouble
-    val phi = if (length > 0) math.acos((dirZ / length).toDouble).toFloat else 0f  // Elevation [0, π]
+    if (length < 0.0001) {
+      return (0.5f, 0.5f)  // Default to center if invalid
+    }
     
-    // Convert to equirectangular UV coordinates
+    val normalizedX = (dirX / length).toFloat
+    val normalizedY = (dirY / length).toFloat
+    val normalizedZ = (dirZ / length).toFloat
+    
+    // Azimuth: angle in xz plane (y is up)
+    // theta = atan2(x, -z) in xz plane
+    val theta = math.atan2(normalizedX, -normalizedZ).toFloat  // [-π, π]
     val u = ((theta + math.Pi) / (2 * math.Pi)).toFloat  // [0, 1]
-    val v = (phi / math.Pi).toFloat  // [0, 1]
+    
+    // Elevation: angle from horizontal plane (y component)
+    // phi = asin(y)
+    val phi = math.asin(math.max(-1.0, math.min(1.0, normalizedY))).toFloat  // [-π/2, π/2]
+    val v = (1.0f - (phi + math.Pi/2.0) / math.Pi).toFloat  // Flip: [0, 1] where 0.5 is horizontal
     
     (u, v)
   }

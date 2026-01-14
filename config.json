@@ -1,0 +1,28 @@
+{
+  "inputVideoPath": "03.mp4",
+  "nodes": [
+    {
+      "nodeId": "node1",
+      "outputPath": "output_node1.mp4",
+      "shaderPath": "shaders/transform",
+      "transformParams": {
+        "brightness": 1.2,
+        "contrast": 1.1
+      },
+      "scale": {
+        "width": 1920,
+        "height": 1080
+      }
+    },
+    {
+      "nodeId": "node2",
+      "outputPath": "output_node2.mp4",
+      "cropRegion": {
+        "x": 0,
+        "y": 0,
+        "width": 960,
+        "height": 540
+      }
+    }
+  ]
+}

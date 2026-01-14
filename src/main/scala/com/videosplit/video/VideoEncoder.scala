@@ -310,24 +310,13 @@ class VideoEncoder(
   /**
    * Cleanup resources
    * Note: Minimal cleanup to avoid crashes. JavaCPP finalizers will handle most cleanup.
-   * Only close I/O to ensure file is written, then let finalizers handle the rest.
+   * av_write_trailer() already closes the file, so we don't need to call avio_closep.
    */
   def close(): Unit = {
-    // Only close I/O to ensure file is fully written
-    // Everything else will be cleaned up by JavaCPP finalizers
-    if (formatContext != null && formatContext.pb() != null) {
-      try {
-        val pbPtr = new PointerPointer[AVIOContext](1)
-        pbPtr.put(0, formatContext.pb())
-        avio_closep(pbPtr)
-      } catch {
-        case e: Exception =>
-          // Ignore errors - file might already be closed
-      }
-    }
-    
-    // Skip all other cleanup - let JavaCPP finalizers handle it
-    // Manual cleanup causes crashes (pthread_mutex_lock, strcmp, etc.)
+    // av_write_trailer() already closes the I/O context
+    // Skip all manual cleanup - let JavaCPP finalizers handle it
+    // Manual cleanup causes crashes (pthread_mutex_lock, strcmp, etc.) and memory issues
+    // Set references to null to help GC
     swsContext = null
     packet = null
     frame = null

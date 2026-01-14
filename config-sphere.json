@@ -1,0 +1,45 @@
+{
+  "inputVideoPath": "fishtrim.mp4",
+  "calibrationDir": "~/_work/ARG/calibration/calibration-current",
+  "nodes": [
+    {
+      "hostname": "gr02"
+    },
+    {
+      "hostname": "gr03"
+    },
+    {
+      "hostname": "gr04"
+    },
+    {
+      "hostname": "gr05"
+    },
+    {
+      "hostname": "gr06"
+    },
+    {
+      "hostname": "gr07"
+    },
+    {
+      "hostname": "gr08"
+    },
+    {
+      "hostname": "gr09"
+    },
+    {
+      "hostname": "gr10"
+    },
+    {
+      "hostname": "gr11"
+    },
+    {
+      "hostname": "gr12"
+    },
+    {
+      "hostname": "gr13"
+    },
+    {
+      "hostname": "gr14"
+    }
+  ]
+}

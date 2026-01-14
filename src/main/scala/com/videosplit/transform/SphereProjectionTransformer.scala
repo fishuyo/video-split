@@ -54,12 +54,8 @@ class SphereProjectionTransformer(
         throw new RuntimeException(s"Failed to initialize OpenGL context: ${e.getMessage}", e)
     }
     
-    // Analyze warp map for decimation opportunities (disabled for now)
-    // analyzeDecimation()
-    // For now, keep all pixels (no decimation)
-    decimationMap = Some(Array.ofDim[Boolean](outputHeight, outputWidth).map(_.map(_ => true)))
-    decimatedWidth = outputWidth
-    decimatedHeight = outputHeight
+    // Analyze warp map for decimation opportunities
+    analyzeDecimation()
     
     // Debug: Print some warp map samples to verify it's loaded correctly
     println(s"Warp map loaded: ${outputWidth}x${outputHeight}")
@@ -72,7 +68,6 @@ class SphereProjectionTransformer(
       println(f"  Pixel ($x%4d, $y%4d): dir=($dirX%8.4f, $dirY%8.4f, $dirZ%8.4f), alpha=$alpha%6.4f, uv=($u%6.4f, $v%6.4f)")
     }
     
-    println(s"Decimation disabled - using full resolution: ${outputWidth}x${outputHeight}")
     
     // Load shader
     shaderProgram = new ShaderProgram()
@@ -95,7 +90,11 @@ class SphereProjectionTransformer(
    * Finds pixels that sample the same equirectangular region
    */
   private def analyzeDecimation(): Unit = {
-    val tolerance = 0.001f  // Tolerance for considering pixels the same
+    // Tolerance for considering pixels the same (in UV space)
+    // Larger tolerance = more aggressive decimation (more pixels considered redundant)
+    // Smaller tolerance = less decimation (only exact duplicates removed)
+    // For equirectangular, pixel density varies by region, so we need some tolerance
+    val tolerance = 0.5f / math.min(inputWidth, inputHeight).toFloat  // ~0.5 pixel tolerance
     
     // Build map of equirectangular UV -> list of projector pixels
     val uvToPixels = scala.collection.mutable.Map[(Float, Float), scala.collection.mutable.ListBuffer[(Int, Int)]]()
@@ -108,14 +107,36 @@ class SphereProjectionTransformer(
       }
     }
     
-    // Find redundant pixels (multiple projector pixels → same equirectangular pixel)
+    // Count unique equirectangular pixels (unique UV coordinates)
+    val uniquePixels = uvToPixels.size
+    val totalPixels = outputWidth * outputHeight
+    
+    // Calculate scale factor based on pixel density
+    // Scale = sqrt(unique_pixels / total_pixels) to maintain 2D area ratio
+    val scaleFactor = math.sqrt(uniquePixels.toDouble / totalPixels.toDouble)
+    
+    // Calculate decimated dimensions maintaining aspect ratio
+    decimatedWidth = math.max(1, (outputWidth * scaleFactor).toInt)
+    decimatedHeight = math.max(1, (outputHeight * scaleFactor).toInt)
+    
+    // Ensure aspect ratio is maintained exactly
+    val aspectRatio = outputWidth.toDouble / outputHeight.toDouble
+    if (decimatedWidth.toDouble / decimatedHeight.toDouble > aspectRatio) {
+      // Width is too large, adjust height
+      decimatedHeight = math.max(1, (decimatedWidth / aspectRatio).toInt)
+    } else {
+      // Height is too large, adjust width
+      decimatedWidth = math.max(1, (decimatedHeight * aspectRatio).toInt)
+    }
+    
+    // Build decimation map: mark pixels to keep (for reference, but we'll scale down instead)
     val keep = Array.ofDim[Boolean](outputHeight, outputWidth)
     var kept = 0
     var removed = 0
     
     uvToPixels.foreach { case (_, pixels) =>
       if (pixels.nonEmpty) {
-        // Keep first pixel, mark others for removal
+        // Keep first pixel in each group
         val (keepX, keepY) = pixels.head
         keep(keepY)(keepX) = true
         kept += 1
@@ -131,29 +152,9 @@ class SphereProjectionTransformer(
     
     decimationMap = Some(keep)
     
-    // Calculate decimated dimensions (bounding box of kept pixels)
-    var minX = outputWidth
-    var maxX = 0
-    var minY = outputHeight
-    var maxY = 0
-    
-    for (y <- 0 until outputHeight) {
-      for (x <- 0 until outputWidth) {
-        if (keep(y)(x)) {
-          minX = math.min(minX, x)
-          maxX = math.max(maxX, x)
-          minY = math.min(minY, y)
-          maxY = math.max(maxY, y)
-        }
-      }
-    }
-    
-    if (minX < maxX && minY < maxY) {
-      decimatedWidth = maxX - minX + 1
-      decimatedHeight = maxY - minY + 1
-    }
-    
     println(s"Decimation analysis: ${outputWidth}x${outputHeight} -> ${decimatedWidth}x${decimatedHeight}")
+    println(f"  Scale factor: ${scaleFactor}%.3f (${scaleFactor * 100}%.1f%%)")
+    println(s"  Unique equirectangular pixels: $uniquePixels / $totalPixels total")
     println(s"  Kept: $kept pixels, Removed: $removed redundant pixels")
   }
   
@@ -384,17 +385,49 @@ class SphereProjectionTransformer(
    * Read framebuffer to AVFrame (decimation disabled for now)
    */
   private def readFramebufferToFrame(): AVFrame = {
-    // Read full resolution framebuffer (no decimation for now)
-    val pixels = new Array[Byte](outputWidth * outputHeight * 3)
+    // Read full resolution framebuffer
+    val fullPixels = new Array[Byte](outputWidth * outputHeight * 3)
     val buffer = MemoryUtil.memAlloc(outputWidth * outputHeight * 3)
     
     glReadPixels(0, 0, outputWidth, outputHeight, GL_RGB, GL_UNSIGNED_BYTE, buffer)
-    buffer.get(pixels)
+    buffer.get(fullPixels)
     MemoryUtil.memFree(buffer)
     
-    // Use full resolution (decimation disabled)
-    val actualWidth = outputWidth
-    val actualHeight = outputHeight
+    // Apply decimation: scale down framebuffer to decimated dimensions
+    val (actualWidth, actualHeight, pixels) = if (decimatedWidth < outputWidth || decimatedHeight < outputHeight) {
+      // Scale down: sample framebuffer at decimated resolution
+      val decimatedPixels = new Array[Byte](decimatedWidth * decimatedHeight * 3)
+      
+      // Sample pixels from full resolution framebuffer
+      // Use nearest-neighbor sampling for simplicity (can be improved with bilinear)
+      for (y <- 0 until decimatedHeight) {
+        for (x <- 0 until decimatedWidth) {
+          // Map decimated coordinates back to full resolution
+          val srcX = (x * outputWidth / decimatedWidth.toDouble).toInt
+          val srcY = (y * outputHeight / decimatedHeight.toDouble).toInt
+          
+          // Flip vertically (OpenGL origin is bottom-left)
+          val flippedSrcY = outputHeight - 1 - srcY
+          val srcOffset = flippedSrcY * outputWidth * 3 + srcX * 3
+          val dstOffset = y * decimatedWidth * 3 + x * 3
+          
+          // Copy pixel (RGB)
+          decimatedPixels(dstOffset) = fullPixels(srcOffset)
+          decimatedPixels(dstOffset + 1) = fullPixels(srcOffset + 1)
+          decimatedPixels(dstOffset + 2) = fullPixels(srcOffset + 2)
+        }
+      }
+      
+      (decimatedWidth, decimatedHeight, decimatedPixels)
+    } else {
+      // No decimation - use full resolution, just flip vertically
+      val flippedPixels = new Array[Byte](outputWidth * outputHeight * 3)
+      for (y <- 0 until outputHeight) {
+        val srcY = outputHeight - 1 - y
+        System.arraycopy(fullPixels, srcY * outputWidth * 3, flippedPixels, y * outputWidth * 3, outputWidth * 3)
+      }
+      (outputWidth, outputHeight, flippedPixels)
+    }
     
     val frame = av_frame_alloc()
     if (frame == null) {
@@ -409,17 +442,15 @@ class SphereProjectionTransformer(
     
     av_image_fill_arrays(frame.data(), frame.linesize(), frameBuffer, AV_PIX_FMT_RGB24, actualWidth, actualHeight, 1)
     
-    // Copy pixels (OpenGL origin is bottom-left, FFmpeg expects top-left)
-    // glReadPixels reads from bottom to top, so we need to flip vertically
+    // Copy pixels to frame (already flipped if decimation was applied)
     val data = frame.data(0)
     val linesize = frame.linesize(0)
     val totalBytes = actualHeight * linesize
     val byteArray = new Array[Byte](totalBytes)
     
-    // Flip vertically: OpenGL reads bottom-to-top, FFmpeg expects top-to-bottom
+    // Copy pixels row by row
     for (y <- 0 until actualHeight) {
-      val srcY = actualHeight - 1 - y  // Read from bottom row first
-      val srcOffset = srcY * actualWidth * 3
+      val srcOffset = y * actualWidth * 3
       val dstOffset = y * linesize
       System.arraycopy(pixels, srcOffset, byteArray, dstOffset, actualWidth * 3)
     }
@@ -448,9 +479,12 @@ class SphereProjectionTransformer(
   def close(): Unit = {
     if (shaderProgram != null) {
       shaderProgram.close()
+      shaderProgram = null
     }
     if (context != null) {
+      // Only destroy window, don't terminate GLFW (for reuse across nodes)
       context.close()
+      context = null
     }
   }
   
@@ -528,13 +562,20 @@ class SphereProjectionTransformer(
       |    // For -z forward, we want z=-1 -> v=0.5
       |    // So shift: v = phi/π - 0.5, wrapped: v = (phi/π - 0.5 + 1.0) mod 1.0 = (phi/π + 0.5) mod 1.0
       |    // 
-      |    // Calculate azimuth (longitude)
-      |    float theta = atan(normalized.y, normalized.x);  // [-π, π]
+      |    // Right-handed coordinates: +x right, -z forward, +y up
+      |    // Center (uv 0.5, 0.5) should map to direction (0, 0, -1)
+      |    // 
+      |    // Azimuth: angle in xz plane (y is up)
+      |    // For (0, 0, -1): theta = atan2(x, -z) = atan2(0, 1) = 0, u = 0.5 ✓
+      |    float theta = atan(normalized.x, -normalized.z);  // [-π, π] in xz plane
       |    float u = (theta + 3.14159265) / (2.0 * 3.14159265);  // [0, 1]
       |    
-      |    // Calculate elevation (latitude)
-      |    float phi = acos(clamp(normalized.z, -1.0, 1.0));  // [0, π]
-      |    float v = phi / 3.14159265;  // [0, 1]
+      |    // Elevation: angle from horizontal plane (y component)
+      |    // For (0, 0, -1): phi = asin(y) = asin(0) = 0, v = 0.5 ✓
+      |    // For (0, 1, 0): phi = asin(1) = π/2, v = 0.0 (top after flip)
+      |    // For (0, -1, 0): phi = asin(-1) = -π/2, v = 1.0 (bottom after flip)
+      |    float phi = asin(clamp(normalized.y, -1.0, 1.0));  // [-π/2, π/2]
+      |    float v = 1.0 - (phi + 1.57079633) / 3.14159265;  // Flip: [0, 1] where 0.5 is horizontal
       |    
       |    return vec2(u, v);
       |}

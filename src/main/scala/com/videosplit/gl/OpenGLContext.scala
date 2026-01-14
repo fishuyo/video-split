@@ -12,7 +12,39 @@ import scala.util.{Try, Success, Failure}
 
 /**
  * Manages an offscreen OpenGL context using GLFW
+ * GLFW initialization is shared across contexts (only initialized once)
  */
+object OpenGLContext {
+  private var glfwInitialized = false
+  private var errorCallback: GLFWErrorCallback = null
+  
+  private def ensureGLFWInitialized(): Unit = synchronized {
+    if (!glfwInitialized) {
+      // Set up error callback
+      errorCallback = GLFWErrorCallback.createPrint(System.err)
+      errorCallback.set()
+      
+      // Initialize GLFW
+      if (!glfwInit()) {
+        throw new IllegalStateException("Unable to initialize GLFW")
+      }
+      
+      glfwInitialized = true
+    }
+  }
+  
+  def terminateGLFW(): Unit = synchronized {
+    if (glfwInitialized) {
+      glfwTerminate()
+      if (errorCallback != null) {
+        errorCallback.free()
+        errorCallback = null
+      }
+      glfwInitialized = false
+    }
+  }
+}
+
 class OpenGLContext(width: Int, height: Int) {
   private var window: Long = NULL
   private var initialized = false
@@ -25,13 +57,8 @@ class OpenGLContext(width: Int, height: Int) {
       throw new IllegalStateException("OpenGL context already initialized")
     }
     
-    // Set up error callback
-    GLFWErrorCallback.createPrint(System.err).set()
-    
-    // Initialize GLFW
-    if (!glfwInit()) {
-      throw new IllegalStateException("Unable to initialize GLFW")
-    }
+    // Ensure GLFW is initialized (shared across all contexts)
+    OpenGLContext.ensureGLFWInitialized()
     
     // Configure GLFW for offscreen rendering
     glfwDefaultWindowHints()
@@ -45,7 +72,6 @@ class OpenGLContext(width: Int, height: Int) {
     window = glfwCreateWindow(width, height, "Offscreen Context", NULL, NULL)
     
     if (window == NULL) {
-      glfwTerminate()
       throw new RuntimeException("Failed to create GLFW window")
     }
     
@@ -93,14 +119,20 @@ class OpenGLContext(width: Int, height: Int) {
   
   /**
    * Cleanup resources
+   * Only destroys this window, does NOT terminate GLFW (for reuse across nodes)
    */
   def close(): Unit = {
     if (initialized && window != NULL) {
       glfwDestroyWindow(window)
-      glfwTerminate()
-      glfwSetErrorCallback(null).free()
       window = NULL
       initialized = false
     }
+  }
+  
+  /**
+   * Terminate GLFW (call this only when all contexts are done)
+   */
+  def terminateGLFW(): Unit = {
+    OpenGLContext.terminateGLFW()
   }
 }
