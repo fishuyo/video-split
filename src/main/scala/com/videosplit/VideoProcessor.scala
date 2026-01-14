@@ -4,6 +4,7 @@ import com.videosplit.calibration.{CalibrationLoader, WarpMap}
 import com.videosplit.config.{ClusterConfig, RenderNodeConfig}
 import com.videosplit.transform.SphereProjectionTransformer
 import com.videosplit.video.{VideoDecoder, VideoEncoder}
+import com.videosplit.gl.OpenGLContext
 import org.bytedeco.ffmpeg.avutil.AVFrame
 import org.bytedeco.ffmpeg.global.avutil.*
 import org.bytedeco.javacpp.{BytePointer, PointerScope}
@@ -13,6 +14,7 @@ import scala.util.{Try, Success, Failure}
 
 /**
  * Main video processor that coordinates decoding, transformation, and encoding
+ * Optimized: Processes one frame at a time across all nodes (decodes once per frame)
  */
 class VideoProcessor(config: ClusterConfig) {
   private val logger = LoggerFactory.getLogger(getClass)
@@ -24,12 +26,22 @@ class VideoProcessor(config: ClusterConfig) {
   private var blackArrayBuffer: Array[Byte] = null
   private var pixelBuffer: Array[Byte] = null
   
-  // Shared OpenGL context for all nodes (reused to avoid initialization overhead)
-  // Note: We'll create it lazily when first needed, with max dimensions
-  private var sharedGLContext: Option[com.videosplit.gl.OpenGLContext] = None
+  /**
+   * State for a single node (encoder + transformers)
+   */
+  private case class NodeState(
+    config: RenderNodeConfig,
+    encoder: VideoEncoder,
+    transformers: List[SphereProjectionTransformer],
+    maxDecimatedWidth: Int,
+    maxDecimatedHeight: Int,
+    combinedWidth: Int,
+    combinedHeight: Int
+  )
 
   /**
    * Process video for all render nodes
+   * Optimized: Decodes frames once, processes each frame for all nodes immediately
    */
   def process(): Try[Unit] = {
     logger.info(s"Starting video processing for ${config.nodes.size} render nodes")
@@ -45,59 +57,392 @@ class VideoProcessor(config: ClusterConfig) {
           
           logger.info(s"Input video: ${width}x${height}, frame rate: ${frameRate.num()}/${frameRate.den()}")
           
-          // Process each render node sequentially
-          // Note: Cannot parallelize because OpenGL/LWJGL must run on main thread
-          // GLFW is initialized once and reused across all nodes
-          try {
-            config.nodes.zipWithIndex.foreach { case (nodeConfig, nodeIdx) =>
-              logger.info(s"Processing node ${nodeIdx + 1}/${config.nodes.size}: ${nodeConfig.getNodeId}")
-              
-              // Each node needs its own decoder (seeking to start independently)
-              val nodeDecoder = new VideoDecoder(config.inputVideoPath)
-              nodeDecoder.initialize() match {
-                case Success(_) =>
-                  try {
-                    processNode(nodeDecoder, nodeConfig, width, height, frameRate, config.inputVideoPath) match {
-                      case Success(_) =>
-                        logger.info(s"Successfully processed node: ${nodeConfig.getNodeId}")
-                      case Failure(e) =>
-                        logger.error(s"Failed to process node ${nodeConfig.getNodeId}: ${e.getMessage}", e)
-                    }
-                  } finally {
-                    nodeDecoder.close()
-                    // Force GC between nodes to free native memory
-                    // This helps release AVFrames and other native resources
-                    System.gc()
-                    Thread.sleep(300)  // Give GC time to run and finalizers to execute
-                  }
-                case Failure(e) =>
-                  logger.error(s"Failed to initialize decoder for node ${nodeConfig.getNodeId}: ${e.getMessage}", e)
-              }
+          // Create shared OpenGL context (one context for all nodes)
+          // Use max dimensions needed across all nodes
+          val maxOutputWidth = config.nodes.flatMap { nodeConfig =>
+            val calibrationDir = nodeConfig.calibrationDir
+              .orElse(config.calibrationDir)
+              .getOrElse("~/_work/ARG/calibration/calibration-current")
+              .replaceFirst("^~", System.getProperty("user.home"))
+            val hostname = nodeConfig.getHostname
+            CalibrationLoader.loadNodeCalibration(hostname, calibrationDir).map { nodeCal =>
+              nodeCal.projectors.map(_.resolution._1).max
             }
-          } finally {
-            // Clean up reusable buffers
-            if (combinedFrameBuffer != null) {
-              av_free(combinedFrameBuffer)
-              combinedFrameBuffer = null
-            }
-            if (combinedFrame != null) {
-              av_frame_unref(combinedFrame)
-              combinedFrame = null
-            }
-            blackArrayBuffer = null
-            pixelBuffer = null
-            
-            // Terminate GLFW only after all nodes are processed
-            com.videosplit.gl.OpenGLContext.terminateGLFW()
-          }
+          }.maxOption.getOrElse(1920)
           
-          Success(())
+          val maxOutputHeight = config.nodes.flatMap { nodeConfig =>
+            val calibrationDir = nodeConfig.calibrationDir
+              .orElse(config.calibrationDir)
+              .getOrElse("~/_work/ARG/calibration/calibration-current")
+              .replaceFirst("^~", System.getProperty("user.home"))
+            val hostname = nodeConfig.getHostname
+            CalibrationLoader.loadNodeCalibration(hostname, calibrationDir).map { nodeCal =>
+              nodeCal.projectors.map(_.resolution._2).max
+            }
+          }.maxOption.getOrElse(1200)
+          
+          logger.info(s"Creating shared OpenGL context: ${maxOutputWidth}x${maxOutputHeight}")
+          val sharedContext = new OpenGLContext(maxOutputWidth, maxOutputHeight)
+          sharedContext.initialize() match {
+            case Success(_) =>
+              // Initialize all nodes upfront (encoders + transformers)
+              // Declare outside try so it's accessible in finally
+              var nodeStates: List[NodeState] = List.empty
+              try {
+                nodeStates = initializeAllNodes(sharedContext, width, height, frameRate)
+                
+                if (nodeStates.isEmpty) {
+                  return Failure(new RuntimeException("No nodes initialized successfully"))
+                }
+                
+                logger.info(s"Initialized ${nodeStates.length} nodes. Starting frame-by-frame processing...")
+                
+                // Process frame-by-frame: decode once, process for all nodes
+                decoder.seekToStart() match {
+                  case Success(_) =>
+                    var frameCount = 0
+                    var consecutiveNoneCount = 0
+                    
+                    while (consecutiveNoneCount < 10) {
+                      decoder.readFrame() match {
+                        case Some(frame) =>
+                          consecutiveNoneCount = 0
+                          try {
+                            if (frame.width() > 0 && frame.height() > 0) {
+                              // Process this frame for all nodes
+                              processFrameForAllNodes(frame, nodeStates) match {
+                                case Success(_) =>
+                                  frameCount += 1
+                                  if (frameCount % 30 == 0) {
+                                    logger.info(s"Processed $frameCount frames")
+                                  }
+                                case Failure(e) =>
+                                  logger.error(s"Failed to process frame $frameCount: ${e.getMessage}", e)
+                                  return Failure(e)
+                              }
+                            }
+                          } finally {
+                            // Unref decoded frame after processing all nodes
+                            av_frame_unref(frame)
+                          }
+                        case None =>
+                          consecutiveNoneCount += 1
+                          if (consecutiveNoneCount >= 3) {
+                            logger.info(s"EOF detected after $frameCount frames")
+                          }
+                      }
+                    }
+                    
+                    // Flush all encoders
+                    logger.info("Flushing all encoders...")
+                    nodeStates.foreach { nodeState =>
+                      nodeState.encoder.finish() match {
+                        case Success(_) =>
+                          logger.info(s"Completed encoding for node: ${nodeState.config.getNodeId}")
+                        case Failure(e) =>
+                          logger.error(s"Failed to finalize encoder for node ${nodeState.config.getNodeId}: ${e.getMessage}", e)
+                      }
+                    }
+                    
+                    logger.info(s"Successfully processed ${frameCount} frames for ${nodeStates.length} nodes")
+                    Success(())
+                  case Failure(e) =>
+                    logger.error(s"Failed to seek decoder: ${e.getMessage}", e)
+                    Failure(e)
+                }
+              } finally {
+                // Cleanup all nodes
+                nodeStates.foreach { nodeState =>
+                  nodeState.encoder.close()
+                  nodeState.transformers.foreach(_.close())
+                }
+              }
+            case Failure(e) =>
+              logger.error(s"Failed to initialize shared OpenGL context: ${e.getMessage}", e)
+              Failure(e)
+          }
         } finally {
           decoder.close()
+          // Clean up reusable buffers
+          if (combinedFrameBuffer != null) {
+            av_free(combinedFrameBuffer)
+            combinedFrameBuffer = null
+          }
+          if (combinedFrame != null) {
+            av_frame_unref(combinedFrame)
+            combinedFrame = null
+          }
+          blackArrayBuffer = null
+          pixelBuffer = null
+          
+          // Terminate GLFW
+          OpenGLContext.terminateGLFW()
         }
       case Failure(e) =>
         logger.error(s"Failed to initialize decoder: ${e.getMessage}", e)
         Failure(e)
+    }
+  }
+  
+  /**
+   * Initialize all nodes upfront (encoders + transformers with shared context)
+   */
+  private def initializeAllNodes(
+    sharedContext: OpenGLContext,
+    inputWidth: Int,
+    inputHeight: Int,
+    frameRate: org.bytedeco.ffmpeg.avutil.AVRational
+  ): List[NodeState] = {
+    config.nodes.flatMap { nodeConfig =>
+      val outputPath = nodeConfig.getOutputPath(config.inputVideoPath)
+      logger.info(s"Initializing node: ${nodeConfig.getNodeId} -> $outputPath")
+      
+      // Get calibration directory
+      val calibrationDir = nodeConfig.calibrationDir
+        .orElse(config.calibrationDir)
+        .getOrElse("~/_work/ARG/calibration/calibration-current")
+        .replaceFirst("^~", System.getProperty("user.home"))
+      
+      val hostname = nodeConfig.getHostname
+      
+      // Load calibration data if hostname is provided
+      val nodeCalibration = CalibrationLoader.loadNodeCalibration(hostname, calibrationDir)
+      
+      val useSphereProjection = nodeCalibration.isDefined
+      
+      if (useSphereProjection) {
+        initializeNodeWithSphereProjection(nodeConfig, inputWidth, inputHeight, frameRate, nodeCalibration.get, calibrationDir, outputPath, sharedContext)
+      } else {
+        initializeNodeSimple(nodeConfig, inputWidth, inputHeight, frameRate, outputPath)
+      }
+    }.toList
+  }
+  
+  /**
+   * Initialize node with sphere projection
+   */
+  private def initializeNodeWithSphereProjection(
+    nodeConfig: RenderNodeConfig,
+    inputWidth: Int,
+    inputHeight: Int,
+    frameRate: org.bytedeco.ffmpeg.avutil.AVRational,
+    nodeCal: com.videosplit.calibration.CalibrationLoader.NodeCalibration,
+    calibrationDir: String,
+    outputPath: String,
+    sharedContext: OpenGLContext
+  ): Option[NodeState] = {
+    logger.info(s"Initializing sphere projection for node ${nodeConfig.getNodeId} with ${nodeCal.projectors.length} projectors")
+    
+    // Load warp maps for all projectors
+    val warpMaps = nodeCal.projectors.map { proj =>
+      val warpMapPath = s"$calibrationDir/${proj.warpMapPath}"
+      CalibrationLoader.loadWarpMap(warpMapPath, proj.resolution._1, proj.resolution._2) match {
+        case Some(map) => Some((proj, map))
+        case None =>
+          logger.error(s"Failed to load warp map for projector ${proj.index}: $warpMapPath")
+          None
+      }
+    }.flatten
+    
+    if (warpMaps.isEmpty) {
+      logger.error(s"No valid warp maps loaded for node ${nodeConfig.getNodeId}")
+      return None
+    }
+    
+    // Create transformers for all projectors (using shared context)
+    val transformers = warpMaps.map { case (proj, warpMap) =>
+      val transformer = new SphereProjectionTransformer(
+        inputWidth,
+        inputHeight,
+        warpMap,
+        proj.resolution._1,
+        proj.resolution._2
+      )
+      (proj, transformer)
+    }
+    
+    // Initialize all transformers with shared context
+    val initializedTransformers = transformers.map { case (proj, transformer) =>
+      transformer.initialize(sharedContext) match {
+        case Success(_) => Some((proj, transformer))
+        case Failure(e) =>
+          logger.error(s"Failed to initialize transformer for projector ${proj.index}: ${e.getMessage}", e)
+          None
+      }
+    }.flatten
+    
+    if (initializedTransformers.isEmpty) {
+      logger.error(s"No transformers initialized for node ${nodeConfig.getNodeId}")
+      return None
+    }
+    
+    // Calculate decimated dimensions
+    val projectorWidths = initializedTransformers.map { case (_, transformer) => transformer.getDecimatedWidth }
+    val projectorHeights = initializedTransformers.map { case (_, transformer) => transformer.getDecimatedHeight }
+    
+    val maxDecimatedWidth = projectorWidths.max
+    val maxDecimatedHeight = projectorHeights.max
+    
+    logger.info(s"Node ${nodeConfig.getNodeId}: Decimated dimensions ${maxDecimatedWidth}x${maxDecimatedHeight}")
+    
+    // Combined output dimensions (side-by-side)
+    val combinedWidth = maxDecimatedWidth * initializedTransformers.length
+    val combinedHeight = maxDecimatedHeight
+    
+    logger.info(s"Node ${nodeConfig.getNodeId}: Combined output ${combinedWidth}x${combinedHeight}")
+    
+    // Create encoder
+    val encoder = new VideoEncoder(
+      outputPath,
+      combinedWidth,
+      combinedHeight,
+      org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_YUV420P,
+      frameRate
+    )
+    
+    encoder.initialize() match {
+      case Success(_) =>
+        Some(NodeState(
+          nodeConfig,
+          encoder,
+          initializedTransformers.map(_._2),
+          maxDecimatedWidth,
+          maxDecimatedHeight,
+          combinedWidth,
+          combinedHeight
+        ))
+      case Failure(e) =>
+        logger.error(s"Failed to initialize encoder for node ${nodeConfig.getNodeId}: ${e.getMessage}", e)
+        None
+    }
+  }
+  
+  /**
+   * Initialize node with simple passthrough
+   */
+  private def initializeNodeSimple(
+    nodeConfig: RenderNodeConfig,
+    inputWidth: Int,
+    inputHeight: Int,
+    frameRate: org.bytedeco.ffmpeg.avutil.AVRational,
+    outputPath: String
+  ): Option[NodeState] = {
+    logger.info(s"Initializing simple passthrough for node ${nodeConfig.getNodeId}")
+    
+    // Determine output dimensions
+    val (outputWidth, outputHeight) = nodeConfig.scale match {
+      case Some(scale) => (scale.width, scale.height)
+      case None => nodeConfig.cropRegion match {
+        case Some(crop) => (crop.width, crop.height)
+        case None => (inputWidth, inputHeight)
+      }
+    }
+    
+    // Create encoder
+    val encoder = new VideoEncoder(
+      outputPath,
+      outputWidth,
+      outputHeight,
+      org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_YUV420P,
+      frameRate
+    )
+    
+    encoder.initialize() match {
+      case Success(_) =>
+        Some(NodeState(
+          nodeConfig,
+          encoder,
+          List.empty, // No transformers for simple passthrough
+          outputWidth,
+          outputHeight,
+          outputWidth,
+          outputHeight
+        ))
+      case Failure(e) =>
+        logger.error(s"Failed to initialize encoder for node ${nodeConfig.getNodeId}: ${e.getMessage}", e)
+        None
+    }
+  }
+  
+  /**
+   * Process one frame for all nodes
+   */
+  private def processFrameForAllNodes(frame: AVFrame, nodeStates: List[NodeState]): Try[Unit] = Try {
+    nodeStates.foreach { nodeState =>
+      if (nodeState.transformers.nonEmpty) {
+        // Sphere projection node
+        processFrameForSphereProjectionNode(frame, nodeState)
+      } else {
+        // Simple passthrough node
+        processFrameForSimpleNode(frame, nodeState)
+      }
+    }
+  }
+  
+  /**
+   * Process frame for sphere projection node
+   */
+  private def processFrameForSphereProjectionNode(frame: AVFrame, nodeState: NodeState): Unit = {
+    // Transform frame for all projectors
+    val transformedFrames = nodeState.transformers.map { transformer =>
+      transformer.transformFrame(frame) match {
+        case Success(tf) => Some(tf)
+        case Failure(e) =>
+          logger.error(s"Failed to transform frame for node ${nodeState.config.getNodeId}: ${e.getMessage}", e)
+          None
+      }
+    }.flatten
+    
+    if (transformedFrames.nonEmpty && transformedFrames.length == nodeState.transformers.length) {
+      // Combine frames side-by-side
+      combineFramesSideBySide(transformedFrames, nodeState.maxDecimatedWidth, nodeState.maxDecimatedHeight, nodeState.combinedWidth, nodeState.combinedHeight) match {
+        case Success(combinedFrame) =>
+          try {
+            // Encode combined frame
+            if (combinedFrame.width() > 0 && combinedFrame.height() > 0) {
+              nodeState.encoder.encodeFrame(combinedFrame) match {
+                case Success(_) => // OK
+                case Failure(e) =>
+                  logger.error(s"Failed to encode frame for node ${nodeState.config.getNodeId}: ${e.getMessage}", e)
+                  throw e
+              }
+            }
+          } finally {
+            av_frame_unref(combinedFrame)
+          }
+        case Failure(e) =>
+          logger.error(s"Failed to combine frames for node ${nodeState.config.getNodeId}: ${e.getMessage}", e)
+          throw e
+      }
+      
+      // Unref transformed frames
+      transformedFrames.foreach { frame =>
+        if (frame != null) {
+          av_frame_unref(frame)
+        }
+      }
+    } else {
+      logger.warn(s"Failed to transform frames for all projectors in node ${nodeState.config.getNodeId} (got ${transformedFrames.length}/${nodeState.transformers.length})")
+      // Unref any frames we did get
+      transformedFrames.foreach { frame =>
+        if (frame != null) {
+          av_frame_unref(frame)
+        }
+      }
+    }
+  }
+  
+  /**
+   * Process frame for simple passthrough node
+   */
+  private def processFrameForSimpleNode(frame: AVFrame, nodeState: NodeState): Unit = {
+    if (frame.width() > 0 && frame.height() > 0) {
+      nodeState.encoder.encodeFrame(frame) match {
+        case Success(_) => // OK
+        case Failure(e) =>
+          logger.error(s"Failed to encode frame for node ${nodeState.config.getNodeId}: ${e.getMessage}", e)
+          throw e
+      }
     }
   }
 

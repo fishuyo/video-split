@@ -42,10 +42,53 @@ class SphereProjectionTransformer(
   private var decimatedHeight: Int = outputHeight
   
   /**
-   * Initialize the transformer
+   * Initialize the transformer with a shared OpenGL context
+   * @param sharedContext The shared OpenGL context (all transformers use the same context)
+   */
+  def initialize(sharedContext: OpenGLContext): Try[Unit] = Try {
+    // Use shared context instead of creating our own
+    context = sharedContext
+    
+    // Ensure context is current (should already be, but be safe)
+    context.makeCurrent()
+    
+    // Analyze warp map for decimation opportunities
+    analyzeDecimation()
+    
+    // Debug: Print some warp map samples to verify it's loaded correctly
+    println(s"Warp map loaded: ${outputWidth}x${outputHeight}")
+    println(s"Sample pixels from warp map:")
+    for (i <- 0 until math.min(5, outputWidth * outputHeight)) {
+      val x = i % outputWidth
+      val y = i / outputWidth
+      val (dirX, dirY, dirZ, alpha) = warpMap.getPixel(x, y)
+      val (u, v) = warpMap.getEquirectangularUV(x, y)
+      println(f"  Pixel ($x%4d, $y%4d): dir=($dirX%8.4f, $dirY%8.4f, $dirZ%8.4f), alpha=$alpha%6.4f, uv=($u%6.4f, $v%6.4f)")
+    }
+    
+    
+    // Load shader
+    shaderProgram = new ShaderProgram()
+    shaderProgram.loadShadersFromSource(
+      warpingVertexShader,
+      warpingFragmentShader
+    ) match {
+      case Success(_) => // OK
+      case Failure(e) =>
+        throw new RuntimeException(s"Failed to compile shaders: ${e.getMessage}", e)
+    }
+    
+    setupBuffers()
+    setupTextures()
+    uploadWarpMap()
+  }
+  
+  /**
+   * Initialize the transformer (creates its own context - for backward compatibility)
+   * @deprecated Use initialize(sharedContext) instead for better performance
    */
   def initialize(): Try[Unit] = Try {
-    // Create OpenGL context
+    // Create OpenGL context (legacy mode)
     context = new OpenGLContext(outputWidth, outputHeight)
     context.initialize() match {
       case Success(_) =>
@@ -312,14 +355,16 @@ class SphereProjectionTransformer(
   
   /**
    * Transform equirectangular frame to projector space (decimation disabled)
+   * Note: Assumes OpenGL context is already current (for shared context usage)
    */
   def transformFrame(inputFrame: AVFrame): Try[AVFrame] = Try {
-    context.makeCurrent()
+    // Note: We don't call makeCurrent() here when using shared context
+    // The caller should ensure context is current before processing all nodes
     
     // Upload input frame
     uploadFrameToTexture(inputFrame)
     
-    // Bind framebuffer
+    // Bind framebuffer (this transformer's own framebuffer)
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer)
     // Set viewport to cover entire output resolution
     glViewport(0, 0, outputWidth, outputHeight)
@@ -481,11 +526,40 @@ class SphereProjectionTransformer(
       shaderProgram.close()
       shaderProgram = null
     }
-    if (context != null) {
-      // Only destroy window, don't terminate GLFW (for reuse across nodes)
-      context.close()
-      context = null
+    // Note: Don't close shared context here - it's managed externally
+    // Only cleanup our own resources (textures, framebuffers, buffers)
+    if (framebuffer != 0) {
+      import org.lwjgl.opengl.GL30.*
+      glDeleteFramebuffers(framebuffer)
+      framebuffer = 0
     }
+    if (inputTexture != 0) {
+      import org.lwjgl.opengl.GL11.*
+      glDeleteTextures(inputTexture)
+      inputTexture = 0
+    }
+    if (warpMapTexture != 0) {
+      import org.lwjgl.opengl.GL11.*
+      glDeleteTextures(warpMapTexture)
+      warpMapTexture = 0
+    }
+    if (outputTexture != 0) {
+      import org.lwjgl.opengl.GL11.*
+      glDeleteTextures(outputTexture)
+      outputTexture = 0
+    }
+    if (vao != 0) {
+      import org.lwjgl.opengl.GL30.*
+      glDeleteVertexArrays(vao)
+      vao = 0
+    }
+    if (vbo != 0) {
+      import org.lwjgl.opengl.GL15.*
+      glDeleteBuffers(vbo)
+      vbo = 0
+    }
+    // Don't close context - it's shared
+    context = null
   }
   
   // Warping shader that samples equirectangular based on warp map
