@@ -1,6 +1,7 @@
 package com.videosplit
 
 import com.videosplit.calibration.{CalibrationLoader, WarpMap}
+import com.videosplit.compositor.NodeCompositor
 import com.videosplit.config.{ClusterConfig, RenderNodeConfig}
 import com.videosplit.transform.SphereProjectionTransformer
 import com.videosplit.video.{VideoDecoder, VideoEncoder}
@@ -27,12 +28,13 @@ class VideoProcessor(config: ClusterConfig) {
   private var pixelBuffer: Array[Byte] = null
   
   /**
-   * State for a single node (encoder + transformers)
+   * State for a single node (encoder + transformers + compositor)
    */
   private case class NodeState(
     config: RenderNodeConfig,
     encoder: VideoEncoder,
     transformers: List[SphereProjectionTransformer],
+    compositor: Option[NodeCompositor],  // None for simple passthrough nodes
     maxDecimatedWidth: Int,
     maxDecimatedHeight: Int,
     combinedWidth: Int,
@@ -154,6 +156,7 @@ class VideoProcessor(config: ClusterConfig) {
                 // Cleanup all nodes
                 nodeStates.foreach { nodeState =>
                   nodeState.encoder.close()
+                  nodeState.compositor.foreach(_.close())
                   nodeState.transformers.foreach(_.close())
                 }
               }
@@ -291,28 +294,45 @@ class VideoProcessor(config: ClusterConfig) {
     
     logger.info(s"Node ${nodeConfig.getNodeId}: Combined output ${combinedWidth}x${combinedHeight}")
     
-    // Create encoder
-    val encoder = new VideoEncoder(
-      outputPath,
+    // Create compositor for GPU-side combining
+    val compositor = new NodeCompositor(
+      initializedTransformers.map(_._2),
       combinedWidth,
       combinedHeight,
-      org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_YUV420P,
-      frameRate
+      maxDecimatedWidth,
+      maxDecimatedHeight
     )
     
-    encoder.initialize() match {
+    compositor.initialize() match {
       case Success(_) =>
-        Some(NodeState(
-          nodeConfig,
-          encoder,
-          initializedTransformers.map(_._2),
-          maxDecimatedWidth,
-          maxDecimatedHeight,
+        // Create encoder
+        val encoder = new VideoEncoder(
+          outputPath,
           combinedWidth,
-          combinedHeight
-        ))
+          combinedHeight,
+          org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_YUV420P,
+          frameRate
+        )
+        
+        encoder.initialize() match {
+          case Success(_) =>
+            Some(NodeState(
+              nodeConfig,
+              encoder,
+              initializedTransformers.map(_._2),
+              Some(compositor),
+              maxDecimatedWidth,
+              maxDecimatedHeight,
+              combinedWidth,
+              combinedHeight
+            ))
+          case Failure(e) =>
+            logger.error(s"Failed to initialize encoder for node ${nodeConfig.getNodeId}: ${e.getMessage}", e)
+            compositor.close()
+            None
+        }
       case Failure(e) =>
-        logger.error(s"Failed to initialize encoder for node ${nodeConfig.getNodeId}: ${e.getMessage}", e)
+        logger.error(s"Failed to initialize compositor for node ${nodeConfig.getNodeId}: ${e.getMessage}", e)
         None
     }
   }
@@ -353,6 +373,7 @@ class VideoProcessor(config: ClusterConfig) {
           nodeConfig,
           encoder,
           List.empty, // No transformers for simple passthrough
+          None, // No compositor for simple passthrough
           outputWidth,
           outputHeight,
           outputWidth,
@@ -381,54 +402,33 @@ class VideoProcessor(config: ClusterConfig) {
   
   /**
    * Process frame for sphere projection node
+   * Uses GPU-side combining via NodeCompositor (much faster than CPU combining)
    */
   private def processFrameForSphereProjectionNode(frame: AVFrame, nodeState: NodeState): Unit = {
-    // Transform frame for all projectors
-    val transformedFrames = nodeState.transformers.map { transformer =>
-      transformer.transformFrame(frame) match {
-        case Success(tf) => Some(tf)
-        case Failure(e) =>
-          logger.error(s"Failed to transform frame for node ${nodeState.config.getNodeId}: ${e.getMessage}", e)
-          None
-      }
-    }.flatten
-    
-    if (transformedFrames.nonEmpty && transformedFrames.length == nodeState.transformers.length) {
-      // Combine frames side-by-side
-      combineFramesSideBySide(transformedFrames, nodeState.maxDecimatedWidth, nodeState.maxDecimatedHeight, nodeState.combinedWidth, nodeState.combinedHeight) match {
-        case Success(combinedFrame) =>
-          try {
-            // Encode combined frame
-            if (combinedFrame.width() > 0 && combinedFrame.height() > 0) {
-              nodeState.encoder.encodeFrame(combinedFrame) match {
-                case Success(_) => // OK
-                case Failure(e) =>
-                  logger.error(s"Failed to encode frame for node ${nodeState.config.getNodeId}: ${e.getMessage}", e)
-                  throw e
+    nodeState.compositor match {
+      case Some(compositor) =>
+        // GPU-side combining: render all projectors side-by-side in one pass
+        compositor.renderCombined(frame) match {
+          case Success(combinedFrame) =>
+            try {
+              // Encode combined frame
+              if (combinedFrame.width() > 0 && combinedFrame.height() > 0) {
+                nodeState.encoder.encodeFrame(combinedFrame) match {
+                  case Success(_) => // OK
+                  case Failure(e) =>
+                    logger.error(s"Failed to encode frame for node ${nodeState.config.getNodeId}: ${e.getMessage}", e)
+                    throw e
+                }
               }
+            } finally {
+              av_frame_unref(combinedFrame)
             }
-          } finally {
-            av_frame_unref(combinedFrame)
-          }
-        case Failure(e) =>
-          logger.error(s"Failed to combine frames for node ${nodeState.config.getNodeId}: ${e.getMessage}", e)
-          throw e
-      }
-      
-      // Unref transformed frames
-      transformedFrames.foreach { frame =>
-        if (frame != null) {
-          av_frame_unref(frame)
+          case Failure(e) =>
+            logger.error(s"Failed to render combined frame for node ${nodeState.config.getNodeId}: ${e.getMessage}", e)
+            throw e
         }
-      }
-    } else {
-      logger.warn(s"Failed to transform frames for all projectors in node ${nodeState.config.getNodeId} (got ${transformedFrames.length}/${nodeState.transformers.length})")
-      // Unref any frames we did get
-      transformedFrames.foreach { frame =>
-        if (frame != null) {
-          av_frame_unref(frame)
-        }
-      }
+      case None =>
+        throw new RuntimeException(s"No compositor for sphere projection node ${nodeState.config.getNodeId}")
     }
   }
   

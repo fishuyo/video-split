@@ -356,6 +356,7 @@ class SphereProjectionTransformer(
   /**
    * Transform equirectangular frame to projector space (decimation disabled)
    * Note: Assumes OpenGL context is already current (for shared context usage)
+   * Returns AVFrame with readback from GPU
    */
   def transformFrame(inputFrame: AVFrame): Try[AVFrame] = Try {
     // Note: We don't call makeCurrent() here when using shared context
@@ -369,27 +370,8 @@ class SphereProjectionTransformer(
     // Set viewport to cover entire output resolution
     glViewport(0, 0, outputWidth, outputHeight)
     
-    // Clear to black
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
-    glClear(GL_COLOR_BUFFER_BIT)
-    
-    // Use shader
-    shaderProgram.use()
-    shaderProgram.setUniform("inputTexture", 0)
-    shaderProgram.setUniform("warpMap", 1)
-    shaderProgram.setUniform("inputSize", inputWidth.toFloat, inputHeight.toFloat)
-    shaderProgram.setUniform("outputSize", outputWidth.toFloat, outputHeight.toFloat)
-    
-    // Bind textures
-    glActiveTexture(GL_TEXTURE0)
-    glBindTexture(GL_TEXTURE_2D, inputTexture)
-    glActiveTexture(GL_TEXTURE1)
-    glBindTexture(GL_TEXTURE_2D, warpMapTexture)
-    
-    // Render fullscreen quad
-    glBindVertexArray(vao)
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0)
-    glBindVertexArray(0)
+    // Render to framebuffer
+    renderWarpedFrame()
     
     // Flush to ensure rendering completes
     glFinish()
@@ -400,6 +382,61 @@ class SphereProjectionTransformer(
     glBindFramebuffer(GL_FRAMEBUFFER, 0)
     
     outputFrame
+  }
+  
+  /**
+   * Render warped frame to current framebuffer/viewport (no readback)
+   * Assumes:
+   * - OpenGL context is current
+   * - Framebuffer is already bound
+   * - Viewport is already set to desired region
+   * 
+   * This is used for GPU-side combining - renders directly to viewport region
+   * without reading back to CPU
+   * 
+   * @param clearViewport If true, clears the viewport region before rendering (default: true)
+   */
+  def renderToViewport(inputFrame: AVFrame, clearViewport: Boolean = true): Unit = {
+    // Upload input frame to texture
+    uploadFrameToTexture(inputFrame)
+    
+    // Render warped frame (uses current viewport)
+    renderWarpedFrame(clearViewport)
+  }
+  
+  /**
+   * Internal method: Render warped frame using current viewport
+   * Assumes framebuffer is bound and viewport is set
+   * 
+   * @param clearViewport If true, clears the viewport region before rendering
+   */
+  private def renderWarpedFrame(clearViewport: Boolean = true): Unit = {
+    // Clear to black (only clears current viewport region) if requested
+    if (clearViewport) {
+      glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
+      glClear(GL_COLOR_BUFFER_BIT)
+    }
+    
+    // Use shader
+    shaderProgram.use()
+    shaderProgram.setUniform("inputTexture", 0)
+    shaderProgram.setUniform("warpMap", 1)
+    shaderProgram.setUniform("inputSize", inputWidth.toFloat, inputHeight.toFloat)
+    // outputSize should match the warp map texture size (outputWidth x outputHeight)
+    // The warp map is sampled using TexCoord [0,1] which maps to the full warp map
+    shaderProgram.setUniform("outputSize", outputWidth.toFloat, outputHeight.toFloat)
+    
+    // Bind textures
+    glActiveTexture(GL_TEXTURE0)
+    glBindTexture(GL_TEXTURE_2D, inputTexture)
+    glActiveTexture(GL_TEXTURE1)
+    glBindTexture(GL_TEXTURE_2D, warpMapTexture)
+    
+    // Render fullscreen quad (will be clipped to current viewport)
+    // The quad covers [-1,1] in both X and Y, which maps to the entire viewport
+    glBindVertexArray(vao)
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0)
+    glBindVertexArray(0)
   }
   
   
