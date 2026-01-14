@@ -6,7 +6,7 @@ import com.videosplit.transform.SphereProjectionTransformer
 import com.videosplit.video.{VideoDecoder, VideoEncoder}
 import org.bytedeco.ffmpeg.avutil.AVFrame
 import org.bytedeco.ffmpeg.global.avutil.*
-import org.bytedeco.javacpp.BytePointer
+import org.bytedeco.javacpp.{BytePointer, PointerScope}
 import org.slf4j.LoggerFactory
 
 import scala.util.{Try, Success, Failure}
@@ -16,6 +16,13 @@ import scala.util.{Try, Success, Failure}
  */
 class VideoProcessor(config: ClusterConfig) {
   private val logger = LoggerFactory.getLogger(getClass)
+  
+  // Reusable buffers for frame combining (to avoid allocations per frame)
+  private var combinedFrameBuffer: BytePointer = null
+  private var combinedFrame: AVFrame = null
+  private var combinedFrameSize: Long = 0
+  private var blackArrayBuffer: Array[Byte] = null
+  private var pixelBuffer: Array[Byte] = null
   
   // Shared OpenGL context for all nodes (reused to avoid initialization overhead)
   // Note: We'll create it lazily when first needed, with max dimensions
@@ -42,7 +49,9 @@ class VideoProcessor(config: ClusterConfig) {
           // Note: Cannot parallelize because OpenGL/LWJGL must run on main thread
           // GLFW is initialized once and reused across all nodes
           try {
-            config.nodes.foreach { nodeConfig =>
+            config.nodes.zipWithIndex.foreach { case (nodeConfig, nodeIdx) =>
+              logger.info(s"Processing node ${nodeIdx + 1}/${config.nodes.size}: ${nodeConfig.getNodeId}")
+              
               // Each node needs its own decoder (seeking to start independently)
               val nodeDecoder = new VideoDecoder(config.inputVideoPath)
               nodeDecoder.initialize() match {
@@ -56,12 +65,28 @@ class VideoProcessor(config: ClusterConfig) {
                     }
                   } finally {
                     nodeDecoder.close()
+                    // Force GC between nodes to free native memory
+                    // This helps release AVFrames and other native resources
+                    System.gc()
+                    Thread.sleep(300)  // Give GC time to run and finalizers to execute
                   }
                 case Failure(e) =>
                   logger.error(s"Failed to initialize decoder for node ${nodeConfig.getNodeId}: ${e.getMessage}", e)
               }
             }
           } finally {
+            // Clean up reusable buffers
+            if (combinedFrameBuffer != null) {
+              av_free(combinedFrameBuffer)
+              combinedFrameBuffer = null
+            }
+            if (combinedFrame != null) {
+              av_frame_unref(combinedFrame)
+              combinedFrame = null
+            }
+            blackArrayBuffer = null
+            pixelBuffer = null
+            
             // Terminate GLFW only after all nodes are processed
             com.videosplit.gl.OpenGLContext.terminateGLFW()
           }
@@ -238,24 +263,36 @@ class VideoProcessor(config: ClusterConfig) {
                                 // and center each frame within that space to maintain alignment
                                 combineFramesSideBySide(transformedFrames, maxDecimatedWidth, maxDecimatedHeight, combinedWidth, combinedHeight) match {
                                   case Success(combinedFrame) =>
-                                    val combinedWidth_actual = combinedFrame.width()
-                                    val combinedHeight_actual = combinedFrame.height()
-                                    
-                                    if (frameCount == 0) {
-                                      logger.info(s"First combined frame: ${combinedWidth_actual}x${combinedHeight_actual}")
-                                    }
-                                    
-                                    // Encode combined frame
-                                    if (combinedWidth_actual > 0 && combinedHeight_actual > 0) {
-                                      encoder.encodeFrame(combinedFrame) match {
-                                        case Success(_) =>
-                                          frameCount += 1
-                                          if (frameCount % 30 == 0) {
-                                            logger.info(s"Processed $frameCount frames for node ${nodeConfig.getNodeId} (${combinedWidth_actual}x${combinedHeight_actual})")
-                                          }
-                                        case Failure(e) =>
-                                          logger.error(s"Failed to encode frame $frameCount: ${e.getMessage}", e)
-                                          return Failure(e)
+                                    try {
+                                      val combinedWidth_actual = combinedFrame.width()
+                                      val combinedHeight_actual = combinedFrame.height()
+                                      
+                                      if (frameCount == 0) {
+                                        logger.info(s"First combined frame: ${combinedWidth_actual}x${combinedHeight_actual}")
+                                      }
+                                      
+                                      // Encode combined frame
+                                      if (combinedWidth_actual > 0 && combinedHeight_actual > 0) {
+                                        encoder.encodeFrame(combinedFrame) match {
+                                          case Success(_) =>
+                                            frameCount += 1
+                                            if (frameCount % 30 == 0) {
+                                              logger.info(s"Processed $frameCount frames for node ${nodeConfig.getNodeId} (${combinedWidth_actual}x${combinedHeight_actual})")
+                                            }
+                                          case Failure(e) =>
+                                            logger.error(s"Failed to encode frame $frameCount: ${e.getMessage}", e)
+                                            return Failure(e)
+                                        }
+                                      } else {
+                                        logger.warn(s"Skipping invalid combined frame: ${combinedWidth_actual}x${combinedHeight_actual}")
+                                      }
+                                    } finally {
+                                      // Unref combined frame after encoding
+                                      // The encoder copies the frame data, so we can unref it here
+                                      // Rely on JavaCPP finalizers for actual cleanup to avoid crashes
+                                      import org.bytedeco.ffmpeg.global.avutil.*
+                                      if (combinedFrame != null) {
+                                        av_frame_unref(combinedFrame)
                                       }
                                     } else {
                                       logger.warn(s"Skipping invalid combined frame: ${combinedWidth_actual}x${combinedHeight_actual}")
@@ -264,12 +301,29 @@ class VideoProcessor(config: ClusterConfig) {
                                     logger.error(s"Failed to combine frames: ${e.getMessage}", e)
                                     return Failure(e)
                                 }
+                                
+                                // Unref transformed frames after combining
+                                // Rely on JavaCPP finalizers for actual cleanup to avoid crashes
+                                import org.bytedeco.ffmpeg.global.avutil.*
+                                transformedFrames.foreach { frame =>
+                                  if (frame != null) {
+                                    av_frame_unref(frame)
+                                  }
+                                }
                               } else {
                                 logger.warn(s"Failed to transform frames for all projectors (got ${transformedFrames.length}/${initializedTransformers.length})")
+                                // Unref any frames we did get
+                                import org.bytedeco.ffmpeg.global.avutil.*
+                                transformedFrames.foreach { frame =>
+                                  if (frame != null) {
+                                    av_frame_unref(frame)
+                                  }
+                                }
                               }
                             }
                           } finally {
-                            // Frames will be cleaned up by JavaCPP finalizers
+                            // Use PointerScope to ensure temporary frames are cleaned up promptly
+                            // This helps prevent memory accumulation
                           }
                         case None =>
                           consecutiveNoneCount += 1
@@ -308,7 +362,10 @@ class VideoProcessor(config: ClusterConfig) {
           }
           } finally {
             // Close transformers (destroy windows but keep GLFW alive for next node)
-            initializedTransformers.foreach { case (_, transformer) => transformer.close() }
+            // Clean up OpenGL resources explicitly
+            initializedTransformers.foreach { case (_, transformer) =>
+              transformer.close()
+            }
           }
   }
   

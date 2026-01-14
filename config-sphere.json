@@ -1,5 +1,5 @@
 {
-  "inputVideoPath": "fishtrim.mp4",
+  "inputVideoPath": "fs2.mp4",
   "calibrationDir": "~/_work/ARG/calibration/calibration-current",
   "nodes": [
     {
