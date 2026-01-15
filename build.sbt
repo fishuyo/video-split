@@ -62,7 +62,7 @@ libraryDependencies ++= Seq(
 // Set via: sbt -Djavacpp.maxphysicalbytes=4G run
 // Or export JAVA_OPTS="-Dorg.bytedeco.javacpp.maxphysicalbytes=4G"
 // Lower values (e.g., 2G, 1G) can help identify memory leaks earlier
-val maxPhysicalBytes = sys.props.getOrElse("javacpp.maxphysicalbytes", "8G")
+val maxPhysicalBytes = sys.props.getOrElse("javacpp.maxphysicalbytes", "16G")
 javaOptions += s"-Dorg.bytedeco.javacpp.maxphysicalbytes=$maxPhysicalBytes"
 
 // macOS: GLFW requires running on main thread
