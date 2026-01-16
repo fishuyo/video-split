@@ -138,13 +138,18 @@ class NodeCompositor(
         throw new RuntimeException("Failed to allocate output frame")
       }
       
-      val numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, combinedWidth, combinedHeight, 1)
-      val frameBuffer = new BytePointer(av_malloc(numBytes))
-      if (frameBuffer == null || frameBuffer.isNull) {
-        throw new RuntimeException("Failed to allocate frame buffer")
-      }
+      // Set frame properties BEFORE allocating buffer
+      frame.width(combinedWidth)
+      frame.height(combinedHeight)
+      frame.format(AV_PIX_FMT_RGB24)
       
-      av_image_fill_arrays(frame.data(), frame.linesize(), frameBuffer, AV_PIX_FMT_RGB24, combinedWidth, combinedHeight, 1)
+      // Use av_frame_get_buffer() so FFmpeg manages the buffer lifecycle
+      // This ensures buffers are freed when av_frame_unref() is called
+      val ret = av_frame_get_buffer(frame, 1)  // 1 = alignment
+      if (ret < 0) {
+        av_frame_free(frame)
+        throw new RuntimeException(s"Failed to allocate frame buffer: $ret")
+      }
       
       // Get actual linesize (may have padding for alignment)
       val data = frame.data(0)
@@ -174,10 +179,7 @@ class NodeCompositor(
       data.position(0)
       data.put(byteArray, 0, totalBytes)
       
-      frame.width(combinedWidth)
-      frame.height(combinedHeight)
-      frame.format(AV_PIX_FMT_RGB24)
-      
+      // Frame properties already set above
       frame
     } finally {
       // Restore original pixel pack alignment

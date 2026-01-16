@@ -750,13 +750,18 @@ class VideoProcessor(config: ClusterConfig) {
       throw new RuntimeException("Failed to allocate combined frame")
     }
     
-    val numBytes = av_image_get_buffer_size(frameFormat, combinedWidth, combinedHeight, 1)
-    val frameBuffer = new BytePointer(av_malloc(numBytes))
-    if (frameBuffer == null || frameBuffer.isNull) {
-      throw new RuntimeException("Failed to allocate frame buffer")
-    }
+    // Set frame properties BEFORE allocating buffer
+    combinedFrame.width(combinedWidth)
+    combinedFrame.height(combinedHeight)
+    combinedFrame.format(frameFormat)
     
-    av_image_fill_arrays(combinedFrame.data(), combinedFrame.linesize(), frameBuffer, frameFormat, combinedWidth, combinedHeight, 1)
+    // Use av_frame_get_buffer() so FFmpeg manages the buffer lifecycle
+    // This ensures buffers are freed when av_frame_unref() is called
+    val ret = av_frame_get_buffer(combinedFrame, 1)  // 1 = alignment
+    if (ret < 0) {
+      av_frame_free(combinedFrame)
+      throw new RuntimeException(s"Failed to allocate frame buffer: $ret")
+    }
     
     // Initialize combined frame to black
     val combinedData = combinedFrame.data(0)
@@ -821,9 +826,7 @@ class VideoProcessor(config: ClusterConfig) {
         xOffset += perProjectorWidth  // Move to next projector's allocated space
       }
     
-    combinedFrame.width(combinedWidth)
-    combinedFrame.height(combinedHeight)
-    combinedFrame.format(frameFormat)
+    // Frame properties already set above before buffer allocation
     
     combinedFrame
   }

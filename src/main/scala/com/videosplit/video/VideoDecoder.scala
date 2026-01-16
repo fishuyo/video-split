@@ -192,12 +192,45 @@ class VideoDecoder(inputPath: String) {
             frameRGB.height(codecContext.height())
             frameRGB.format(AV_PIX_FMT_RGB24)
             
-            // Clone the frame so caller owns it independently
-            // av_frame_clone creates a new AVFrame with its own reference to the data
-            val clonedFrame = av_frame_clone(frameRGB)
+            // Create a new frame and copy data to avoid memory leaks
+            // Use FFmpeg's buffer management instead of manual allocation
+            val clonedFrame = av_frame_alloc()
             if (clonedFrame == null) {
               return None
             }
+            
+            // Set frame properties BEFORE allocating buffer
+            clonedFrame.width(codecContext.width())
+            clonedFrame.height(codecContext.height())
+            clonedFrame.format(AV_PIX_FMT_RGB24)
+            
+            // Use av_frame_get_buffer() so FFmpeg manages the buffer lifecycle
+            val ret = av_frame_get_buffer(clonedFrame, 1)  // 1 = alignment
+            if (ret < 0) {
+              av_frame_free(clonedFrame)
+              return None
+            }
+            
+            // Copy pixel data from frameRGB to clonedFrame
+            val srcData = frameRGB.data(0)
+            val dstData = clonedFrame.data(0)
+            val srcLinesize = frameRGB.linesize(0)
+            val dstLinesize = clonedFrame.linesize(0)
+            val height = codecContext.height()
+            val width = codecContext.width()
+            
+            for (y <- 0 until height) {
+              val srcOffset = y * srcLinesize
+              val dstOffset = y * dstLinesize
+              val rowBytes = width * 3
+              val rowData = new Array[Byte](rowBytes)
+              srcData.position(srcOffset)
+              srcData.get(rowData, 0, rowBytes)
+              dstData.position(dstOffset)
+              dstData.put(rowData, 0, rowBytes)
+            }
+            
+            // Frame properties already set above before buffer allocation
             
             return Some(clonedFrame)
           }
@@ -248,11 +281,16 @@ class VideoDecoder(inputPath: String) {
    * Note: Minimal cleanup to avoid crashes. JavaCPP finalizers will handle most cleanup.
    */
   def close(): Unit = {
+    // Free swsContext explicitly to prevent memory leak
+    if (swsContext != null) {
+      sws_freeContext(swsContext)
+      swsContext = null
+    }
+    
     // Skip all manual cleanup - let JavaCPP finalizers handle everything
     // Manual cleanup causes crashes (pthread_mutex_lock, strcmp, etc.)
     
     // Just null out references to help GC
-    swsContext = null
     packet = null
     frameRGB = null
     frame = null

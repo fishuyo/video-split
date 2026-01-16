@@ -212,9 +212,10 @@ class VideoEncoder(
     
     // Check if dimensions match - if not, recreate swscale context
     if (swsContext == null || inputWidth != width || inputHeight != height) {
-      // Free old context if exists
+      // Free old context if exists (CRITICAL: prevents memory leak)
       if (swsContext != null) {
         sws_freeContext(swsContext)
+        swsContext = null  // Set to null after freeing
       }
       
       swsContext = sws_getContext(
@@ -313,11 +314,16 @@ class VideoEncoder(
    * av_write_trailer() already closes the file, so we don't need to call avio_closep.
    */
   def close(): Unit = {
+    // Free swsContext explicitly to prevent memory leak
+    if (swsContext != null) {
+      sws_freeContext(swsContext)
+      swsContext = null
+    }
+    
     // av_write_trailer() already closes the I/O context
     // Skip all manual cleanup - let JavaCPP finalizers handle it
     // Manual cleanup causes crashes (pthread_mutex_lock, strcmp, etc.) and memory issues
     // Set references to null to help GC
-    swsContext = null
     packet = null
     frame = null
     codecContext = null

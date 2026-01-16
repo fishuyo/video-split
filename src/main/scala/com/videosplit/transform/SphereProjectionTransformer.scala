@@ -516,13 +516,18 @@ class SphereProjectionTransformer(
       throw new RuntimeException("Failed to allocate output frame")
     }
     
-    val numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, actualWidth, actualHeight, 1)
-    val frameBuffer = new BytePointer(av_malloc(numBytes))
-    if (frameBuffer == null || frameBuffer.isNull) {
-      throw new RuntimeException("Failed to allocate frame buffer")
-    }
+    // Set frame properties BEFORE allocating buffer
+    frame.width(actualWidth)
+    frame.height(actualHeight)
+    frame.format(AV_PIX_FMT_RGB24)
     
-    av_image_fill_arrays(frame.data(), frame.linesize(), frameBuffer, AV_PIX_FMT_RGB24, actualWidth, actualHeight, 1)
+    // Use av_frame_get_buffer() so FFmpeg manages the buffer lifecycle
+    // This ensures buffers are freed when av_frame_unref() is called
+    val ret = av_frame_get_buffer(frame, 1)  // 1 = alignment
+    if (ret < 0) {
+      av_frame_free(frame)
+      throw new RuntimeException(s"Failed to allocate frame buffer: $ret")
+    }
     
     // Copy pixels to frame (already flipped if decimation was applied)
     val data = frame.data(0)
@@ -540,9 +545,7 @@ class SphereProjectionTransformer(
     data.position(0)
     data.put(byteArray, 0, totalBytes)
     
-    frame.width(actualWidth)
-    frame.height(actualHeight)
-    frame.format(AV_PIX_FMT_RGB24)
+    // Frame properties already set above
     
     // Debug: Verify frame is valid
     if (actualWidth <= 0 || actualHeight <= 0) {
