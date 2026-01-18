@@ -30,24 +30,46 @@ class VideoDecoder(inputPath: String) {
    * Initialize the decoder
    */
   def initialize(): Try[Unit] = Try {
-    // Native libraries should auto-load via JavaCPP
+    // Ensure native libraries are loaded before any FFmpeg calls
+    // This is critical on Linux to avoid crashes
+    try {
+      Loader.load(classOf[org.bytedeco.ffmpeg.global.avformat])
+      Loader.load(classOf[org.bytedeco.ffmpeg.global.avcodec])
+      Loader.load(classOf[org.bytedeco.ffmpeg.global.avutil])
+    } catch {
+      case e: Exception =>
+        // Libraries may already be loaded, which is fine
+        // Just log and continue
+    }
     
     // Register all formats and codecs
     avformat_network_init()
     
     // Open video file - avformat_open_input expects a PointerPointer that it will fill
+    // Use absolute path to avoid path resolution issues on Linux
+    val absolutePath = new java.io.File(inputPath).getAbsolutePath
+    
     // Store BytePointer in a variable to prevent garbage collection before native call completes
     // This is critical on Linux where GC can cause crashes
+    // BytePointer(String) automatically handles UTF-8 encoding and null termination
+    // Explicitly ensure null termination by getting bytes and creating BytePointer
+    val pathBytes = absolutePath.getBytes("UTF-8")
+    val inputPathPtr = new BytePointer(pathBytes.length + 1) // +1 for null terminator
+    inputPathPtr.put(pathBytes)
+    inputPathPtr.put(pathBytes.length, 0.toByte) // Explicit null terminator
+    
+    // Create PointerPointer - initialize to null (required on some Linux systems)
     val formatContextPtr = new PointerPointer[AVFormatContext](1)
-    val inputPathPtr = new BytePointer(inputPath)
+    formatContextPtr.put(0, null.asInstanceOf[Pointer])
     
     // Use synchronized block to prevent threading issues (similar to VideoEncoder)
+    // On Linux, FFmpeg may have stricter requirements for thread safety
     val ret = synchronized {
       avformat_open_input(formatContextPtr, inputPathPtr, null, null)
     }
     
     if (ret != 0) {
-      throw new RuntimeException(s"Could not open file: $inputPath (error code: $ret)")
+      throw new RuntimeException(s"Could not open file: $absolutePath (error code: $ret)")
     }
     formatContext = formatContextPtr.get(classOf[AVFormatContext], 0)
     if (formatContext == null) {
