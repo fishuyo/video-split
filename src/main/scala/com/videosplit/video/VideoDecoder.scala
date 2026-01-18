@@ -36,8 +36,16 @@ class VideoDecoder(inputPath: String) {
     avformat_network_init()
     
     // Open video file - avformat_open_input expects a PointerPointer that it will fill
+    // Store BytePointer in a variable to prevent garbage collection before native call completes
+    // This is critical on Linux where GC can cause crashes
     val formatContextPtr = new PointerPointer[AVFormatContext](1)
-    val ret = avformat_open_input(formatContextPtr, new BytePointer(inputPath), null, null)
+    val inputPathPtr = new BytePointer(inputPath)
+    
+    // Use synchronized block to prevent threading issues (similar to VideoEncoder)
+    val ret = synchronized {
+      avformat_open_input(formatContextPtr, inputPathPtr, null, null)
+    }
+    
     if (ret != 0) {
       throw new RuntimeException(s"Could not open file: $inputPath (error code: $ret)")
     }
